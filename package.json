@@ -1,0 +1,15 @@
+{
+  "name": "animal-arena-server",
+  "version": "1.0.0",
+  "description": "PVP matchmaking + relay server for Animal Arena",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}
