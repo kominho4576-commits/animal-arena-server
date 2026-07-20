@@ -61,14 +61,33 @@ function identifyClient(token) {
 /* ===== 접속 중인 계정 추적(친구 온라인 표시용) — 매치/파티용 임시 소켓이 많아 계정당 여러 ws가 동시에 열릴 수 있음 ===== */
 const onlineByAccount = new Map(); // accountId -> Set(ws)
 function markOnline(accountId, ws) {
-  if (!onlineByAccount.has(accountId)) onlineByAccount.set(accountId, new Set());
+  const wasOffline = !onlineByAccount.has(accountId);
+  if (wasOffline) onlineByAccount.set(accountId, new Set());
   onlineByAccount.get(accountId).add(ws);
+  return wasOffline; // 오프라인 -> 온라인 전환 여부 (친구들에게 실시간 통지용)
 }
 function markOffline(accountId, ws) {
   const set = onlineByAccount.get(accountId);
-  if (!set) return;
+  if (!set) return false;
   set.delete(ws);
-  if (set.size === 0) onlineByAccount.delete(accountId);
+  if (set.size === 0) { onlineByAccount.delete(accountId); return true; } // 마지막 소켓 종료 -> 오프라인 전환
+  return false;
+}
+/* 특정 계정의 모든 접속 소켓에 최신 친구 목록을 밀어넣음 — 닉네임 변경/온라인 상태 변화의 실시간 반영용 */
+function pushFriendListToAccount(accountId) {
+  const acc = accounts[accountId];
+  const set = onlineByAccount.get(accountId);
+  if (!acc || !set) return;
+  const friends = buildFriendList(acc);
+  for (const ws of set) send(ws, { type: 'friend_list_result', friends });
+}
+/* 이 계정의 정보(닉네임/온라인 상태)가 바뀌었을 때, 온라인 상태인 친구 전원의 친구 목록을 갱신 */
+function notifyFriendsChanged(accountId) {
+  const acc = accounts[accountId];
+  if (!acc) return;
+  for (const fid of (acc.friends || [])) {
+    if (onlineByAccount.has(fid)) pushFriendListToAccount(fid);
+  }
 }
 
 /* ===== 닉네임 검증: 2~12자 · 영문/숫자/한글/밑줄만 허용 · 최소 비속어 필터 · 전역 유일성 ===== */
@@ -117,7 +136,9 @@ const teamQueues = { // size(한 팀 인원) -> gameMode -> 대기 중인 그룹
 function teamPrune(size, gameMode) {
   const q = teamQueues[size][gameMode];
   for (let i = q.length - 1; i >= 0; i--) {
+    const t = q[i]._t;
     q[i] = q[i].filter(ws => ws && ws.readyState === ws.OPEN);
+    if (t !== undefined) q[i]._t = t; // filter가 새 배열을 만들어 _t를 잃지 않도록 복원
     if (q[i].length === 0) q.splice(i, 1);
   }
 }
@@ -127,6 +148,9 @@ function teamBroadcastWait(size, gameMode) {
   for (const g of q) for (const ws of g) send(ws, { type: 'team_wait', count, need: size * 2, size, gameMode });
 }
 function teamQueueGroup(size, gameMode, group) {
+  // 같은 소켓이 다른 그룹에 중복 등록되어 있으면 먼저 제거 (중복 매칭 방지)
+  for (const ws of group) teamQueueRemove(ws);
+  group._t = Date.now(); // 봇 채움 타이머 기준 시각
   if (!teamQueues[size][gameMode].some(g => g === group)) teamQueues[size][gameMode].push(group);
   teamTryStart(size, gameMode);
 }
@@ -189,7 +213,9 @@ function teamQueueRemove(ws) {
       let changed = false;
       for (let i = q.length - 1; i >= 0; i--) {
         const before = q[i].length;
+        const t = q[i]._t;
         q[i] = q[i].filter(w => w !== ws);
+        if (t !== undefined) q[i]._t = t;
         if (q[i].length !== before) changed = true;
         if (q[i].length === 0) q.splice(i, 1);
       }
@@ -197,6 +223,78 @@ function teamQueueRemove(ws) {
     }
   }
 }
+
+/* ===== 팀전(2v2/3v3) 봇 채움 매칭 =====
+   실제 플레이어를 항상 우선 매칭하되(teamTryStart), 일정 시간(TEAM_BOT_FILL_MS) 안에
+   정원이 안 차면 대기 중인 실제 플레이어들만 모아 부족한 자리를 AI 봇으로 채워 시작한다.
+   - 파티(그룹)는 절대 쪼개지 않고 통째로 같은 팀에 배정 -> 파티원은 항상 같은 게임/팀/맵
+   - 봇 슬롯은 members[idx]=null 로 표시 -> relay()가 to=봇idx 메시지를 방 전체에 브로드캐스트하고
+     호스트(idx 0, 항상 실제 플레이어)가 봇을 시뮬레이션/판정 (클라이언트의 파티봇 경로 재사용) */
+const TEAM_BOT_FILL_MS = 10000;
+const BOT_SPECIES = ['rabbit', 'cat', 'bear', 'panda', 'frog', 'dog', 'tiger', 'koala', 'pig', 'chick', 'wolf', 'fox'];
+const BOT_NICK_POOL = ['제로', '칼바람', '야옹이', '불꽃여우', '다크나이트', 'sniper_K', '한방있음', '슈가', '고구마', '바람돌이',
+  '무민', '토깽이', '청설모', '달빛', '새벽감성', '폭풍전야', '노랑이', '민초단', '귀요미', '철벽수비',
+  '겜잘알', '원샷원킬', '샐러드', '초코송이', '빵야', '라이언', '흑표범', '은하수', 'soju', '치즈볼'];
+function teamStartWithBots(size, gameMode) {
+  teamPrune(size, gameMode);
+  const q = teamQueues[size][gameMode];
+  if (!q.length) return;
+  // FIFO로 그룹(파티)을 쪼개지 않고 배정: red부터 채우고, 안 들어가면 blue 시도
+  const redReal = [], blueReal = [], picked = [];
+  for (const g of q) {
+    if (g.length <= size - redReal.length) { redReal.push(...g); picked.push(g); }
+    else if (g.length <= size - blueReal.length) { blueReal.push(...g); picked.push(g); }
+    if (redReal.length === size && blueReal.length === size) break;
+  }
+  if (!redReal.length && !blueReal.length) return;
+  for (const g of picked) { const i = q.indexOf(g); if (i >= 0) q.splice(i, 1); }
+  const realMembers = [...redReal, ...blueReal]; // idx 0..n-1 (idx 0 = 항상 실제 플레이어 = 호스트)
+  const need = size * 2;
+  const botCount = need - realMembers.length;
+  // 봇 종/닉네임: 실제 참가자와 겹치지 않게 선택
+  const usedNicks = new Set(realMembers.map(w => (clients.get(w) || {}).nick || ''));
+  const speciesPool = BOT_SPECIES.filter(s => !realMembers.some(w => (clients.get(w) || {}).species === s));
+  const nickPool = BOT_NICK_POOL.filter(n => !usedNicks.has(n));
+  const pickSpecies = () => speciesPool.length
+    ? speciesPool.splice(Math.floor(Math.random() * speciesPool.length), 1)[0]
+    : BOT_SPECIES[Math.floor(Math.random() * BOT_SPECIES.length)];
+  const pickNick = () => nickPool.length
+    ? nickPool.splice(Math.floor(Math.random() * nickPool.length), 1)[0]
+    : 'Player' + (100 + Math.floor(Math.random() * 899));
+  const roomId = 't' + (nextRoom++);
+  const seed = (Math.random() * 1e9) | 0;
+  const members = [], players = [], team = {};
+  let idx = 0;
+  const addReal = (ws, t) => {
+    members[idx] = ws; team[idx] = t;
+    const c = clients.get(ws);
+    players.push({ idx, species: c ? c.species : 'rabbit', nick: c ? c.nick : '', team: t });
+    idx++;
+  };
+  redReal.forEach(ws => addReal(ws, 'red'));
+  blueReal.forEach(ws => addReal(ws, 'blue'));
+  const addBot = (t) => { members[idx] = null; team[idx] = t; players.push({ idx, species: pickSpecies(), nick: pickNick(), team: t, bot: true }); idx++; };
+  for (let i = 0; i < size - redReal.length; i++) addBot('red');
+  for (let i = 0; i < size - blueReal.length; i++) addBot('blue');
+  rooms.set(roomId, { id: roomId, ffa: true, members, team });
+  realMembers.forEach((ws, i) => {
+    const c = clients.get(ws);
+    if (c) { c.room = roomId; c.role = (i === 0 ? 'host' : 'guest'); c.idx = i; c.ffa = true; }
+    send(ws, { type: 'team_matched', room: roomId, idx: i, seed, size, gameMode, players });
+  });
+  console.log(`[team${size}v${size}/${gameMode}] ${roomId}: ${realMembers.length} players + ${botCount} bots (fill)`);
+  teamBroadcastWait(size, gameMode);
+}
+// 주기 점검: 실제 인원 우선 매칭 재시도 -> 가장 오래 기다린 그룹이 기준 시간을 넘겼으면 봇 채움 시작
+setInterval(() => {
+  for (const size of [2, 3]) {
+    for (const gameMode of ['deathmatch', 'timeattack']) {
+      teamTryStart(size, gameMode); // 실제 플레이어끼리 정원이 차면 항상 이쪽이 우선
+      const q = teamQueues[size][gameMode];
+      if (q.length && q[0]._t && (Date.now() - q[0]._t) >= TEAM_BOT_FILL_MS) teamStartWithBots(size, gameMode);
+    }
+  }
+}, 2000);
 
 /* ===== 팀 매칭용 파티(초대): 2v2/3v3에서 친구를 초대해 항상 같은 팀으로 큐에 들어감 =====
    봇 없음, 방장 외 전원 준비완료 후 실제 팀 매칭 큐(teamQueues)로 편입됨. */
@@ -220,7 +318,7 @@ function ensureTeamParty(ws, c, size, gameMode) {
 function tpRoster(party) {
   return party.members.map((ws, i) => {
     const c = clients.get(ws);
-    return { i, species: c ? c.species : 'rabbit', nick: c ? c.nick : '', isHost: ws === party.host, ready: party.ready.has(ws) };
+    return { i, species: c ? c.species : 'rabbit', nick: c ? c.nick : '', isHost: ws === party.host, ready: party.ready.has(ws), aid: c ? (c.accountId || null) : null };
   });
 }
 function tpBroadcast(party) {
@@ -340,8 +438,10 @@ wss.on('connection', (ws) => {
         // 고유 ID 발급/조회: token이 있으면 같은 계정으로, 없으면 새로 발급
         const acc = identifyClient((msg.token || '').toString());
         c.accountId = acc.id;
-        markOnline(acc.id, ws);
-        send(ws, { type: 'identified', id: acc.id, token: acc.token });
+        if (acc.nickname && !c.nick) c.nick = acc.nickname; // 계정 닉네임을 소켓 표시명 기본값으로 (파티 로스터 '(닉네임 없음)' 방지)
+        const cameOnline = markOnline(acc.id, ws);
+        send(ws, { type: 'identified', id: acc.id, token: acc.token, nickname: acc.nickname || '' });
+        if (cameOnline) notifyFriendsChanged(acc.id); // 친구들 목록에 온라인 상태 즉시 반영
         break;
       }
 
@@ -355,8 +455,14 @@ wss.on('connection', (ws) => {
         const acc = accounts[c.accountId];
         if (!acc) { send(ws, { type: 'nickname_set_failed', reason: '계정 정보가 없습니다' }); break; }
         acc.nickname = nickname; c.nick = nickname;
+        // 같은 계정의 다른 접속 소켓(파티/매치용)들도 표시명 동기화
+        const mySockets = onlineByAccount.get(c.accountId);
+        if (mySockets) for (const sws of mySockets) { const sc = clients.get(sws); if (sc) sc.nick = nickname; }
         saveAccountsSoon();
         send(ws, { type: 'nickname_set', nickname });
+        notifyFriendsChanged(c.accountId); // 온라인 친구들의 친구 목록에 새 닉네임 즉시 반영
+        // 파티에 들어가 있으면 파티 로스터에도 즉시 반영
+        if (c.teamPartyCode && teamPartyRooms.has(c.teamPartyCode)) tpBroadcast(teamPartyRooms.get(c.teamPartyCode));
         break;
       }
 
@@ -477,7 +583,7 @@ wss.on('connection', (ws) => {
         // 초대받은 쪽이 거절 — 파티장에게만 알림 (파티 자체는 그대로 유지)
         const code = (msg.code || '').toString().toUpperCase().trim();
         const party = teamPartyRooms.get(code);
-        if (party && party.host) send(party.host, { type: 'team_party_invite_declined', nick: c.nick || '' });
+        if (party && party.host) send(party.host, { type: 'team_party_invite_declined', nick: c.nick || '', aid: c.accountId || null });
         break;
       }
 
@@ -551,7 +657,10 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     const c = clients.get(ws);
-    if (c && c.accountId) markOffline(c.accountId, ws);
+    if (c && c.accountId) {
+      const wentOffline = markOffline(c.accountId, ws);
+      if (wentOffline) notifyFriendsChanged(c.accountId); // 친구들 목록에 오프라인 상태 즉시 반영
+    }
     for (const gm of ['deathmatch', 'timeattack']) { const i = queues[gm].indexOf(ws); if (i >= 0) queues[gm].splice(i, 1); }
     teamQueueRemove(ws);
     tpPartyLeave(ws);
