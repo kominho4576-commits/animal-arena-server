@@ -740,6 +740,7 @@ wss.on('connection', (ws) => {
       // 게임 중 실시간 메시지: 그대로 상대에게 중계
       case 'input':    // guest -> host: 내 입력
       case 'state':    // 위치/회전/애니 상태 브로드캐스트
+      case 'bot_state':// host -> 나머지: 호스트가 시뮬레이션하는 봇 퍼펫 상태 (없으면 봇이 스폰지점에 멈춰 안 보임)
       case 'fire':     // 발사 이벤트
       case 'hit':      // host -> guest: 데미지 판정 결과
       case 'kill':     // host -> guest: 킬 확정
