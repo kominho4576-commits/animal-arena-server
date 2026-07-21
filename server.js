@@ -51,7 +51,7 @@ function identifyClient(token) {
     if (accounts[id]) return accounts[id];
   }
   const id = genUserId();
-  const acc = { id, token: genToken(), nickname: '', friends: [], createdAt: Date.now() };
+  const acc = { id, token: genToken(), nickname: '', friends: [], friendReqIn: [], friendReqOut: [], createdAt: Date.now() };
   accounts[id] = acc;
   tokenToId.set(acc.token, id);
   saveAccountsSoon();
@@ -105,6 +105,21 @@ function buildFriendList(me) {
     const f = accounts[fid];
     return { id: fid, nickname: f ? (f.nickname || '') : '(알 수 없음)', online: onlineByAccount.has(fid) };
   });
+}
+/* 나에게 들어온 친구 요청(수락 대기) 목록 — 보낸 사람의 ID/닉네임 */
+function buildRequestList(me) {
+  return (me.friendReqIn || []).map(rid => {
+    const r = accounts[rid];
+    return { id: rid, nickname: r ? (r.nickname || '') : '(알 수 없음)' };
+  });
+}
+/* 특정 계정의 모든 접속 소켓에 최신 친구요청 목록을 밀어넣음 (실시간 요청 알림용) */
+function pushRequestsToAccount(accountId) {
+  const acc = accounts[accountId];
+  const set = onlineByAccount.get(accountId);
+  if (!acc || !set) return;
+  const requests = buildRequestList(acc);
+  for (const ws of set) send(ws, { type: 'friend_requests_result', requests });
 }
 
 // 간단한 health-check용 http 서버 (Render가 포트 열림 확인)
@@ -438,9 +453,18 @@ wss.on('connection', (ws) => {
         // 고유 ID 발급/조회: token이 있으면 같은 계정으로, 없으면 새로 발급
         const acc = identifyClient((msg.token || '').toString());
         c.accountId = acc.id;
+        // 클라이언트가 로컬에 저장한 닉네임을 함께 보냈고, 서버 계정엔 닉네임이 비어 있으면 복원한다.
+        // (Render 재배포로 계정 저장소가 초기화돼도 이름/ID가 항상 같이 전달되어 '이름없음'으로 뜨지 않게)
+        const sentNick = (msg.nick || '').toString().trim();
+        if (sentNick && !acc.nickname && sentNick.length >= 2 && sentNick.length <= 12
+            && /^[a-zA-Z0-9가-힣_]+$/.test(sentNick) && !containsBadWord(sentNick) && !nicknameTaken(sentNick, acc.id)) {
+          acc.nickname = sentNick; saveAccountsSoon();
+          notifyFriendsChanged(acc.id);
+        }
         if (acc.nickname && !c.nick) c.nick = acc.nickname; // 계정 닉네임을 소켓 표시명 기본값으로 (파티 로스터 '(닉네임 없음)' 방지)
         const cameOnline = markOnline(acc.id, ws);
         send(ws, { type: 'identified', id: acc.id, token: acc.token, nickname: acc.nickname || '' });
+        pushRequestsToAccount(acc.id); // 접속 시 대기 중인 친구 요청 즉시 전달
         if (cameOnline) notifyFriendsChanged(acc.id); // 친구들 목록에 온라인 상태 즉시 반영
         break;
       }
@@ -483,17 +507,79 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      case 'friend_add': {
+      case 'friend_add':        // 구버전 클라 호환: 즉시추가 대신 요청 전송으로 처리
+      case 'friend_request': {
         if (!c.accountId) break;
         const me = accounts[c.accountId];
         const target = accounts[(msg.id || '').toString()];
         if (!me || !target) { send(ws, { type: 'friend_add_result', ok: false, reason: '존재하지 않는 ID입니다' }); break; }
         if (target.id === me.id) { send(ws, { type: 'friend_add_result', ok: false, reason: '자기 자신은 추가할 수 없습니다' }); break; }
         me.friends = me.friends || []; target.friends = target.friends || [];
-        if (!me.friends.includes(target.id)) me.friends.push(target.id);
+        me.friendReqIn = me.friendReqIn || []; me.friendReqOut = me.friendReqOut || [];
+        target.friendReqIn = target.friendReqIn || []; target.friendReqOut = target.friendReqOut || [];
+        if (me.friends.includes(target.id)) { send(ws, { type: 'friend_add_result', ok: false, reason: '이미 친구입니다' }); break; }
+        // 상대가 이미 나에게 요청을 보내둔 상태라면 → 바로 서로 친구로 성립(맞요청 자동 수락)
+        if (me.friendReqIn.includes(target.id)) {
+          me.friendReqIn = me.friendReqIn.filter(x => x !== target.id);
+          target.friendReqOut = (target.friendReqOut || []).filter(x => x !== me.id);
+          me.friends.push(target.id); target.friends.push(me.id);
+          saveAccountsSoon();
+          send(ws, { type: 'friend_add_result', ok: true, accepted: true, id: target.id, nickname: target.nickname || '' });
+          send(ws, { type: 'friend_list_result', friends: buildFriendList(me) });
+          pushRequestsToAccount(me.id);
+          notifyFriendsChanged(me.id); notifyFriendsChanged(target.id);
+          break;
+        }
+        if (me.friendReqOut.includes(target.id)) { send(ws, { type: 'friend_add_result', ok: false, reason: '이미 요청을 보냈습니다' }); break; }
+        me.friendReqOut.push(target.id);
+        target.friendReqIn.push(me.id);
+        saveAccountsSoon();
+        send(ws, { type: 'friend_add_result', ok: true, requested: true, id: target.id, nickname: target.nickname || '' });
+        pushRequestsToAccount(target.id); // 상대가 접속 중이면 즉시 요청 목록 갱신
+        break;
+      }
+
+      case 'friend_accept': {
+        if (!c.accountId) break;
+        const me = accounts[c.accountId];
+        const fromId = (msg.id || '').toString();
+        const target = accounts[fromId];
+        if (!me) break;
+        me.friendReqIn = me.friendReqIn || [];
+        if (!me.friendReqIn.includes(fromId) || !target) {
+          send(ws, { type: 'friend_requests_result', requests: buildRequestList(me) });
+          break;
+        }
+        me.friendReqIn = me.friendReqIn.filter(x => x !== fromId);
+        target.friendReqOut = (target.friendReqOut || []).filter(x => x !== me.id);
+        me.friends = me.friends || []; target.friends = target.friends || [];
+        if (!me.friends.includes(fromId)) me.friends.push(fromId);
         if (!target.friends.includes(me.id)) target.friends.push(me.id);
         saveAccountsSoon();
-        send(ws, { type: 'friend_add_result', ok: true, id: target.id, nickname: target.nickname || '' });
+        send(ws, { type: 'friend_requests_result', requests: buildRequestList(me) });
+        send(ws, { type: 'friend_list_result', friends: buildFriendList(me) });
+        pushFriendListToAccount(fromId); // 요청 보낸 쪽 친구목록 즉시 갱신
+        notifyFriendsChanged(me.id); notifyFriendsChanged(fromId);
+        break;
+      }
+
+      case 'friend_decline': {
+        if (!c.accountId) break;
+        const me = accounts[c.accountId];
+        const fromId = (msg.id || '').toString();
+        if (!me) break;
+        me.friendReqIn = (me.friendReqIn || []).filter(x => x !== fromId);
+        const target = accounts[fromId];
+        if (target) target.friendReqOut = (target.friendReqOut || []).filter(x => x !== me.id);
+        saveAccountsSoon();
+        send(ws, { type: 'friend_requests_result', requests: buildRequestList(me) });
+        break;
+      }
+
+      case 'friend_requests': {
+        if (!c.accountId) { send(ws, { type: 'friend_requests_result', requests: [] }); break; }
+        const me = accounts[c.accountId];
+        send(ws, { type: 'friend_requests_result', requests: me ? buildRequestList(me) : [] });
         break;
       }
 
@@ -502,10 +588,17 @@ wss.on('connection', (ws) => {
         const me = accounts[c.accountId]; if (!me) break;
         const targetId = (msg.id || '').toString();
         me.friends = (me.friends || []).filter(fid => fid !== targetId);
+        me.friendReqIn = (me.friendReqIn || []).filter(fid => fid !== targetId);
+        me.friendReqOut = (me.friendReqOut || []).filter(fid => fid !== targetId);
         const target = accounts[targetId];
-        if (target) target.friends = (target.friends || []).filter(fid => fid !== c.accountId);
+        if (target) {
+          target.friends = (target.friends || []).filter(fid => fid !== c.accountId);
+          target.friendReqIn = (target.friendReqIn || []).filter(fid => fid !== c.accountId);
+          target.friendReqOut = (target.friendReqOut || []).filter(fid => fid !== c.accountId);
+        }
         saveAccountsSoon();
         send(ws, { type: 'friend_list_result', friends: buildFriendList(me) });
+        send(ws, { type: 'friend_requests_result', requests: buildRequestList(me) });
         break;
       }
 
@@ -600,6 +693,16 @@ wss.on('connection', (ws) => {
         c.teamPartyCode = code;
         send(ws, { type: 'team_party_joined', code, size: party.size, gameMode: party.gameMode, idx: party.members.length - 1 });
         tpBroadcast(party);
+        break;
+      }
+
+      case 'team_party_update': {
+        // 파티에 들어간 상태에서 캐릭터/닉네임을 바꾸면 로스터에 실시간 반영
+        if (msg.species) c.species = msg.species;
+        if (msg.nick !== undefined) c.nick = (msg.nick || '').toString().slice(0, 12);
+        if (!c.teamPartyCode) break;
+        const party = teamPartyRooms.get(c.teamPartyCode);
+        if (party && !party.started) tpBroadcast(party);
         break;
       }
 
