@@ -15,22 +15,60 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 
-/* ===== 계정(고유 ID) 파일 저장소 =====
-   완전한 영속성은 아님(Render 무료 플랜은 재배포 시 디스크가 초기화될 수 있음) —
-   서버가 떠 있는 동안은 device token으로 같은 고유 ID를 계속 재사용할 수 있게 하는 최소 구현. */
+/* ===== 계정(고유 ID) 저장소 =====
+   1순위: Upstash Redis(REST) — 환경변수 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN 설정 시.
+          Render 무료 플랜의 휘발성 파일시스템과 달리 재배포·수면(15분) 후에도 계정/친구/친추가 유지됨.
+   2순위(백업): 로컬 파일 — Redis 미설정 시 폴백(서버 재시작 시 초기화될 수 있음). */
 const ACCOUNTS_FILE = path.join(__dirname, 'data', 'accounts.json');
-let accounts = {}; // id -> {id, token, nickname, createdAt}
-try {
-  fs.mkdirSync(path.dirname(ACCOUNTS_FILE), { recursive: true });
-  accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-} catch (e) { accounts = {}; }
-const tokenToId = new Map(Object.values(accounts).map(a => [a.token, a.id]));
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_KEY = 'aa:accounts';
+const useRedis = !!(REDIS_URL && REDIS_TOKEN);
+let accounts = {}; // id -> {id, token, nickname, friends, friendReqIn, friendReqOut, createdAt}
+const tokenToId = new Map();
+
+/* Upstash REST 명령 실행: POST <url> body=["CMD","arg",...] → { result }. 실패 시 null 반환(서버는 계속 동작). */
+async function redisCmd(args) {
+  if (!useRedis) return null;
+  try {
+    const res = await fetch(REDIS_URL, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + REDIS_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    if (!res.ok) { console.error('[redis] HTTP', res.status); return null; }
+    const j = await res.json();
+    return j && Object.prototype.hasOwnProperty.call(j, 'result') ? j.result : null;
+  } catch (e) { console.error('[redis] err', e && e.message); return null; }
+}
+function rebuildTokenIndex() {
+  tokenToId.clear();
+  for (const a of Object.values(accounts)) if (a && a.token) tokenToId.set(a.token, a.id);
+}
+/* 시작 시 계정 로드: Redis 우선, 없으면 파일 폴백 */
+async function loadAccounts() {
+  if (useRedis) {
+    const raw = await redisCmd(['GET', REDIS_KEY]);
+    if (raw) { try { accounts = JSON.parse(raw); } catch (e) { accounts = {}; } console.log('[redis] loaded ' + Object.keys(accounts).length + ' accounts'); }
+    else console.log('[redis] no existing accounts (fresh)');
+  } else {
+    try {
+      fs.mkdirSync(path.dirname(ACCOUNTS_FILE), { recursive: true });
+      accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    } catch (e) { accounts = {}; }
+    console.log('[file] loaded ' + Object.keys(accounts).length + ' accounts (Redis 미설정 — 재시작 시 초기화될 수 있음)');
+  }
+  rebuildTokenIndex();
+}
+
 let accountsSaveTimer = null;
 function saveAccountsSoon() {
   if (accountsSaveTimer) return;
   accountsSaveTimer = setTimeout(() => {
     accountsSaveTimer = null;
-    fs.writeFile(ACCOUNTS_FILE, JSON.stringify(accounts), () => {});
+    const json = JSON.stringify(accounts);
+    if (useRedis) redisCmd(['SET', REDIS_KEY, json]);
+    else fs.writeFile(ACCOUNTS_FILE, json, () => {});
   }, 2000);
 }
 function genToken() {
@@ -783,6 +821,9 @@ setInterval(() => {
   }
 }, 30000);
 
-server.listen(PORT, () => {
-  console.log(`Animal Arena PVP server on :${PORT}`);
+// 계정 저장소를 먼저 로드한 뒤 접속을 받기 시작 (Redis 로드 전 접속 시 새 계정이 발급되는 것 방지)
+loadAccounts().catch(e => console.error('[boot] loadAccounts failed', e && e.message)).finally(() => {
+  server.listen(PORT, () => {
+    console.log(`Animal Arena PVP server on :${PORT} (store: ${useRedis ? 'Upstash Redis' : 'file(휘발성)'})`);
+  });
 });

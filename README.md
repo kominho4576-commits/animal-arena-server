@@ -17,6 +17,19 @@ health check: http://localhost:8080/health
 4. 배포 완료 후 나오는 주소를 wss:// 로 게임에 설정:
    index.html 의 `window.__PVP_SERVER = "wss://<새주소>.onrender.com";`
 
+## 계정/친구 영속 저장 (Upstash Redis) — 권장
+Render 무료 플랜은 파일시스템이 휘발성이라 재배포·15분 수면 후 계정/친구/친추가 초기화됩니다.
+Upstash Redis(무료 티어)를 연결하면 유지됩니다.
+
+1. https://upstash.com → 가입 → Create Database (Redis, Region은 서버와 가까운 곳)
+2. 데이터베이스 상세 페이지의 **REST API** 섹션에서 두 값 복사:
+   - `UPSTASH_REDIS_REST_URL`
+   - `UPSTASH_REDIS_REST_TOKEN`
+3. Render → 해당 Web Service → **Environment** 에 두 값을 환경변수로 추가 → 저장(자동 재배포)
+4. 로그에 `(store: Upstash Redis)` 와 `[redis] loaded N accounts` 가 보이면 정상.
+
+환경변수를 설정하지 않으면 자동으로 로컬 파일(휘발성)로 폴백합니다 — 코드 변경 없이 켜고 끌 수 있습니다.
+
 ## 프로토콜 (요약)
 - 1v1: queue / createroom / joinroom → matched(role: host|guest)
 - 개인전: queue_ffa → ffa_wait(count,secs) → ffa_matched(idx, seed, players[])
